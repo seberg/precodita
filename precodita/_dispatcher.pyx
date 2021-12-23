@@ -271,6 +271,25 @@ cdef class Dispatchable:
     cdef unicode _repr
     cdef dict __dict__
 
+    def __cinit__(self, extractor, fallback=None):
+        global _all_backends
+
+        self.extractor = extractor
+        self.fallback = fallback
+        self.alternatives = []
+        if fallback is None:
+            update_wrapper(self, extractor)
+            self._repr = repr(extractor)
+        else:
+            update_wrapper(self, fallback)
+            self._repr = repr(fallback)
+
+        self._clear_cache()  # initialize the cache
+
+        for backend in _all_backends:
+            if (<Backend>backend).callback is not None:
+                (<Backend>backend).callback(backend, self)
+
     @classmethod
     def from_fallback(cls, extractor, fallback=None):
         """Allows using an existing method as a fallback.  In this path
@@ -306,25 +325,6 @@ cdef class Dispatchable:
             return cls(extractor, fallback)
 
         return lambda func: cls(extractor, func)
-
-    def __cinit__(self, extractor, fallback=None):
-        global _all_backends
-
-        self.extractor = extractor
-        self.fallback = fallback
-        self.alternatives = []
-        if fallback is None:
-            update_wrapper(self, extractor)
-            self._repr = repr(extractor)
-        else:
-            update_wrapper(self, fallback)
-            self._repr = repr(fallback)
-        
-        self._clear_cache()  # initialize the cache
-
-        for backend in _all_backends:
-            if (<Backend>backend).callback is not None:
-                (<Backend>backend).callback(backend, self)
 
     def __repr__(self):
         return self._repr
