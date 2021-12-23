@@ -247,24 +247,25 @@ cdef sorted_unique_types(tuple types):
     return tuple(unique)
 
 
-DEF DCACHE_SIZE = 20
-DEF FCACHE_SIZE = 20
+DEF CACHE_SIZE = 20
 
 
 @cython.final
 cdef class Dispatchable:
     cdef object extractor
     cdef object fallback
-    # fcache: dict to cache fixed-type results (lists of matches)
-    # Note: We pop and readd to the cache, to use it as an LRU...
-    cdef dict fcache  # cache for non-mutable results
-    cdef int64_t fc_hits
-    cdef int64_t fc_misses
-    # dcache: dict to cache "dynamic" final result (context dependend)
-    cdef int64_t dcache_priority  # priority
-    cdef dict dcache
-    cdef int64_t dc_hits
-    cdef int64_t dc_misses
+
+    # The value maps the (unique and sorted) `types` to the dispatch targets:
+    # (List[(backend, implementation)],
+    #       (_max_priority_when_stored, (backend, implementation)))
+    # I.e. a tuple that first contains all possible choices where the backend
+    # selection could still modify which one we pick, and second contains the
+    # correct pick assuming the `_max_priority` is unchanged since it was
+    # stored.
+    cdef dict cache
+    cdef int64_t c_hits
+    cdef int64_t c_misses
+    cdef int64_t c_priority_misses
 
     cdef list alternatives
     cdef unicode _repr
@@ -319,9 +320,7 @@ cdef class Dispatchable:
             update_wrapper(self, fallback)
             self._repr = repr(fallback)
         
-        self.fcache = {}
-        self.dcache = {}
-        self.dcache_priority = -1
+        self._clear_cache()  # initialize the cache
 
         for backend in _all_backends:
             if (<Backend>backend).callback is not None:
@@ -352,25 +351,42 @@ cdef class Dispatchable:
         """Clear all caches and reset the cache stats.
 
         """
-        self.fcache = {}
-        self.c_fhits = 0
-        self.c_fmisses = 0
-        self.dcache = {}
-        self.c_dhits = 0
-        self.c_dmisses = 0
+        self.cache = {}
+        self.c_hits = 0
+        self.c_misses = 0
+        self.c_priority_misses = 0
 
     @property
     def _cache_stats(self):
-        """Cache stats for debugging only
+        """Cache stats for debugging only.
+
+        Returns
+        -------
+        cache_hits : int
+            The number of times the type cache was hit.
+        cache_misses : int
+            The number of times the type cache was not hit.
+        priority_misses : int
+            The number of times the type cache was hit, but the backend
+            priorities may have changed so that the short-list of potential
+            matches had to be compared again.
         """
-        return self.fc_hits, self.fc_misses, self.dc_hits, self.dc_misses
+        return self.c_hits, self.c_misses, self.c_priority_misses
 
     @property
     def backends(self):
-        return [a[0] for a in self.alternatives]
+        """A list of backends, a leading `None` denotes that a fallback
+        exists.
+        """
+        return [a[0] for a in self.implementations]
 
     @property
     def implementations(self):
+        """A list of `(backend, implementation)` tuples.  `None` for a backend
+        denotes the fallback.
+        """
+        if self.fallback:
+            return [(None, self.fallback)] + self.alternatives
         return self.alternatives[:]
 
     def invoke(self, *types):
@@ -409,7 +425,10 @@ cdef class Dispatchable:
         cdef Backend best = None
         cdef Backend b, cb
         cdef int used_mutable_priority = 0
-        cdef list curr = None
+        cdef list matching_impls = None
+
+        cdef tuple cached
+        cdef tuple prioritized_impl = None
         cdef object res = None
 
         typet = sorted_unique_types(types)
@@ -419,72 +438,74 @@ cdef class Dispatchable:
                 return None, self.fallback
             raise TypeError(f"Function called without types, but has no fallback!")
 
-        # See if this is cached:
-        cached = self.fcache.pop(typet, None)
+        # See if this is cached (pop and re-insert) to ensure least recently
+        # used values remain at the "end" of the cache dict.  Allowing us
+        # to pop the first key to keep the cache size limited.
+        cached = self.cache.pop(typet, None)
         if cached is not None:
-            self.fcache[typet] = cached
-            self.fc_hits += 1
-            curr = cached
+            self.cache[typet] = cached
+            self.c_hits += 1
+            matching_impls, prioritized_impl = cached
         else:
-            self.fc_misses += 1
+            self.c_misses += 1
 
-        if curr is None or len(curr) > 1:
-            # See if result is cached, assuming that no priority was changed:
-            if _max_priority != self.dcache_priority:
-                self.dcache = {}  # simply clear it
-            else:
-                res = self.dcache.pop(typet, None)
-                if res is not None:
-                    self.dcache[typet] = res
-                    self.dc_hits += 1
-                    return res
+        if matching_impls is not None and len(matching_impls) > 1:
+            # See if we already know which prioritized implementation to know
+            # this requires that the global _max_priority is unchanged:
+            if _max_priority == prioritized_impl[0]:
+                return prioritized_impl[1]
 
-            self.dc_misses += 1
+            self.c_priority_misses += 1
 
-        if curr is None:
+        # If the cache was a miss, build the list of possible implementations
+        # for the input types
+        if matching_impls is None:
             # Caches failed us, build full list of alternatives:
-            curr = []
+            matching_impls = []
             for b, f in self.alternatives:
                 if not b.matches(typet):
                     continue
                 
-                for i, c in enumerate(curr):
+                for i, c in enumerate(matching_impls):
                     cb = <Backend>(c[0])
                     if cb < b:
                         break
                     elif b < cb:
                         # replace and break
-                        curr[i] = b, f
+                        matching_impls[i] = b, f
                         break
                 else:
                     # A new possible backend to use:
-                    curr.append((b, f))
+                    matching_impls.append((b, f))
 
-            # Add to the fcache:
-            if len(self.fcache) >= FCACHE_SIZE:
-                self.fcache.pop(next(iter(self.fcache)))
-            self.fcache[typet] = curr
+            # Pop the oldest item from the cache dictionary (limit max size):
+            if len(self.cache) >= CACHE_SIZE:
+                self.cache.pop(next(iter(self.cache)))
 
-        if len(curr) == 0:
+            # Add to the cache, use (-1, None) to indicate that if there is
+            # more than one match, we do not know which one to use yet.
+            # We will replace this entry once we found which one to use:
+            self.cache[typet] = matching_impls, (-1, None)
+
+        if len(matching_impls) == 0:
             if self.fallback is not None:
                 res = None, self.fallback
-        elif len(curr) == 1:
-            res = curr[0]
-        elif len(curr) > 1:
+        elif len(matching_impls) == 1:
+            res = matching_impls[0]
+        elif len(matching_impls) > 1:
             res = None
-            for c in curr:
+            for c in matching_impls:
                 cb = c[0]
 
                 if cb.get_priority() < 0:
                     continue
 
                 if res is not None and res[0].dispatch_type is not cb.dispatch_type:
-                    print(res, cb)
                     raise TypeError("Multiple matching implementations found!")
 
                 # TODO: If this is used, we may be using priorities (even of
-                #       always-active backends) to tie-brake.  We may give a
-                #       warning for this in some cases, or at least allow
+                #       always-active backends) to tie-brake.  We may want to
+                #       give a warning for this in some cases. Or allow
                 #       enabling a warning for debug purposes.
                 if res is None or cb.get_priority() > (<Backend>res[0]).get_priority():
                     res = c
@@ -493,11 +514,9 @@ cdef class Dispatchable:
                 res = None, self.fallback
 
             if res is not None:
-                # Add the result to the dcache (presumably priorities were used)
-                if len(self.dcache) >= DCACHE_SIZE:
-                    self.dcache.pop(next(iter(self.dcache)))
-                self.dcache[typet] = res
-                self.dcache_priority = _max_priority
+                # Add the actual (mutable) result to the cached value,
+                # overriding the previous value or (-1, None) placeholder
+                self.cache[typet] = matching_impls, (_max_priority, res)
 
         if res is None:
             # No implementation seems to be available
