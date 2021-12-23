@@ -8,6 +8,17 @@ cimport cython
 from cpython.object cimport PyObject, Py_LT
 from libc.stdint cimport int64_t
 
+
+cdef extern from "Python.h":
+    cdef object PyObject_Vectorcall(
+            object callable, PyObject **args, Py_ssize_t nargs, PyObject *kwnames)
+
+    cdef unsigned long Py_TPFLAGS_HAVE_VECTORCALL
+
+    ctypedef struct PyTypeObject:
+        unsigned long tp_flags
+        Py_ssize_t tp_vectorcall_offset
+
 import contextvars
 
 import abc
@@ -253,6 +264,7 @@ DEF FCACHE_SIZE = 20
 
 @cython.final
 cdef class Dispatchable:
+    cdef void *_vectorcall
     cdef object extractor
     cdef object fallback
     # fcache: dict to cache fixed-type results (lists of matches)
@@ -309,6 +321,7 @@ cdef class Dispatchable:
     def __cinit__(self, extractor, fallback=None):
         global _all_backends
 
+        self._vectorcall = <void *>self.__vectorcall__
         self.extractor = extractor
         self.fallback = fallback
         self.alternatives = []
@@ -521,4 +534,24 @@ cdef class Dispatchable:
                     "backends cannot return NotImplemented to defer right now!")
 
         return res
+
+    @staticmethod
+    cdef __vectorcall__(Dispatchable self, PyObject **args, Py_ssize_t nargs, PyObject *kwnames):
+        relevant = PyObject_Vectorcall(self.extractor, args, nargs, kwnames)
+        types = [type(r) for r in relevant if r is not None]
+
+        _, func = self.dispatch(tuple(types))
+        res = PyObject_Vectorcall(func, args, nargs, kwnames)
+
+        if res is NotImplemented:
+            raise NotImplementedError(
+                    "backends cannot return NotImplemented to defer right now!")
+
+        return res
+
+
+cdef Dispatchable dummy = Dispatchable(lambda: None, lambda: None)
+
+(<PyTypeObject *>Dispatchable).tp_flags |=  Py_TPFLAGS_HAVE_VECTORCALL
+(<PyTypeObject *>Dispatchable).tp_vectorcall_offset = 3 * sizeof(void *)
 
