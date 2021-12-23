@@ -345,10 +345,13 @@ cdef class Dispatchable:
                 raise ValueError("Backend already has an alternative registered.")
 
         self.alternatives.append((backend, func))
-        self.cache = {}
+        self._clear_cache()
         return func
 
-    cdef _clear_cache(self):
+    cpdef _clear_cache(self):
+        """Clear all caches and reset the cache stats.
+
+        """
         self.fcache = {}
         self.c_fhits = 0
         self.c_fmisses = 0
