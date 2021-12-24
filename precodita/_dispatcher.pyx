@@ -237,13 +237,13 @@ cdef sorted_unique_types(tuple types):
     for t in types:
         for i in range(len(unique)):
             if t is unique[i]:
-                continue
+                break
             if <PyObject *>unique[i] > <PyObject *>t:
                 unique.insert(i, t)
-            break
+                break
         else:
             unique.append(t)
-        
+
     return tuple(unique)
 
 
