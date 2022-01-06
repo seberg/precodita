@@ -88,7 +88,3 @@ The case of more precise would not be simple otherwise.
   types `(np.ndarray | astropy.Quantity)`, but not sure it is really necessary
   in practice.
 
-
-(PS: Adding a GPL license for the heck of it.  But obviously will relicense
-as MIT on request, if contributions come in, or if it becomes a bit more
-polished.)

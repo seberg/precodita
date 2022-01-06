@@ -67,8 +67,8 @@ def func(a, b, c=None):
     define the parameters which are dispatched on.  In this case, `a` and `c`.
     `None` will be ignored during dispatch.
 
-    Currently, there is no "fallback" when there are no matches, this could
-    be added easily however!
+    There is no "fallback" here when there are no matches, see below for
+    an example that does this.
     
     Further, `uarray` has the "replacer" dynamic, which is convenient.
     Replacers could be used for extraction of parameters as well, so we could
